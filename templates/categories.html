@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manage Categories</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f7f6;
+            margin: 0;
+            padding: 40px 20px;
+        }
+        .container {
+            background-color: #ffffff;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+            width: 100%;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 5px;
+            text-align: center;
+        }
+        .subtitle {
+            color: #666;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #444;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            box-sizing: border-box;
+            font-size: 15px;
+            background-color: #ffffff;
+        }
+        button {
+            width: 100%;
+            background-color: #3498db;
+            color: white;
+            padding: 14px;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background 0.2s;
+            margin-top: 10px;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        hr {
+            border: 0;
+            height: 1px;
+            background: #e0e0e0;
+            margin: 40px 0 30px 0;
+        }
+        h2 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+            background: #fff;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        th, td {
+            padding: 14px;
+            text-align: left;
+            border-bottom: 1px solid #eeeeee;
+        }
+        th {
+            background-color: #f8f9fa;
+            font-weight: 600;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <!-- 🧭 Navigation Bar links -->
+    <div style="text-align: right; margin-bottom: 20px;">
+        <a href="/" style="margin-right: 15px; color: #2ecc71; text-decoration: none; font-weight: bold;">🏠 Dashboard</a>
+        <a href="/categories" style="color: #3498db; text-decoration: none; font-weight: bold;">⚙️ Manage Categories</a>
+    </div>
+
+    <h1>Manage Categories</h1>
+    <p class="subtitle">Add or remove custom classification tags</p>
+
+    <!-- ➕ Form to Add a New Category -->
+    <form method="POST" action="/categories">
+        <div class="form-group">
+            <label for="category_name">Category Name:</label>
+            <input type="text" id="category_name" name="category_name" placeholder="e.g. Entertainment, Subscriptions" required>
+        </div>
+        <button type="submit">Add New Category</button>
+    </form>
+
+    <hr>
+
+    <!-- 📋 Existing Categories Grid Table -->
+    <h2>Current Categories</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Category Name</th>
+                <th style="text-align: right;">Action</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for cat in categories %}
+            <tr>
+                <td>
+                    <span style="background: #eef2f3; padding: 6px 12px; border-radius: 4px; font-weight: 500; color: #333;">
+                        {{ cat[1] }}
+                    </span>
+                </td>
+                <td style="text-align: right;">
+                    <a href="/categories/delete/{{ cat[0] }}" 
+                       style="color: #e74c3c; text-decoration: none; font-weight: bold; font-size: 13px;" 
+                       onclick="return confirm('Are you sure you want to delete this category?');">
+                       Delete
+                    </a>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="2" style="text-align: center; color: #999; padding: 20px;">No custom categories found.</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+</body>
+</html>
