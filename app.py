@@ -1,3 +1,4 @@
+import os
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 from werkzeug.security import generate_password_hash, check_password_hash
 import psycopg2
@@ -17,8 +18,14 @@ DB_CONFIG = {
 }
 
 def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG)
-
+    database_url = os.environ.get('DATABASE_URL')
+    if database_url:
+        # Running in the cloud on Render
+        return psycopg2.connect(database_url)
+    else:
+        # Running locally on your laptop
+        return psycopg2.connect(**DB_CONFIG)
+    
 # Authentication Decorator
 def login_required(view):
     @functools.wraps(view)
