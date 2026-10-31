@@ -1,453 +1,373 @@
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+from werkzeug.security import generate_password_hash, check_password_hash
 import psycopg2
-from flask import Flask, render_template, request, redirect
+import functools
+from datetime import datetime
 
 app = Flask(__name__)
+app.secret_key = "expense-tracker-secret-key-change-in-production"
 
+# Database Configuration (ensure password matches your local PostgreSQL 18 setup)
 DB_CONFIG = {
-    "dbname": "Expense_Tracker",
+    "dbname": "expense_tracker",
     "user": "postgres",
-    "password": "postgres",  
+    "password": "7499",
     "host": "localhost",
-    "port": "5433" 
+    "port": "5432"
 }
 
-def get_shared_layout_data(cursor):
-    """Helper function to fetch layout details to keep code DRY (Don't Repeat Yourself)."""
-    # 1. Fetch total sum of all expenses
-    cursor.execute("SELECT SUM(amount) FROM Expense;")
-    total_result = cursor.fetchone()[0]
-    total_spent = total_result if total_result is not None else 0.00
+def get_db_connection():
+    return psycopg2.connect(**DB_CONFIG)
 
-    # 2. Fetch categories for dropdown
-    cursor.execute("SELECT category_id, category_name FROM Category ORDER BY category_name ASC;")
-    all_categories = cursor.fetchall()
+# Authentication Decorator
+def login_required(view):
+    @functools.wraps(view)
+    def wrapped_view(**kwargs):
+        if 'user_id' not in session:
+            flash("Please log in to access this page.", "warning")
+            return redirect(url_for('login'))
+        return view(**kwargs)
+    return wrapped_view
+
+# Shared Navigation & Budget Summary Helper
+def get_shared_layout_data(cursor, user_id):
+    current_month = datetime.now().month
+    current_year = datetime.now().year
     
-    # 3. Fetch updated expenses history table with precise budget alerts (Strict Single Rows!)
-    cursor.execute('''
+    cursor.execute("""
         SELECT 
-            e.amount, 
-            e.description, 
-            TO_CHAR(e.date, 'DD-Mon-YYYY'), 
-            c.category_name, 
-            e.expense_id, 
-            e.category_id,
-            COALESCE((
-                SELECT b.budget_amount
-                FROM Budget b
-                WHERE b.category_id = e.category_id 
-                  AND b.budget_month = EXTRACT(MONTH FROM e.date)
-                  AND b.budget_year = EXTRACT(YEAR FROM e.date)
-                LIMIT 1
-            ), 0) AS budget_limit,
-            COALESCE((
-                SELECT SUM(sub_e.amount)
-                FROM Expense sub_e
-                WHERE sub_e.category_id = e.category_id 
-                  AND EXTRACT(MONTH FROM sub_e.date) = EXTRACT(MONTH FROM e.date)
-                  AND EXTRACT(YEAR FROM sub_e.date) = EXTRACT(YEAR FROM e.date)
-            ), 0) AS total_spent_that_month
+            COALESCE(SUM(b.budget_amount), 0) AS total_budget,
+            COALESCE(SUM(e.amount), 0) AS total_spent
+        FROM Budget b
+        LEFT JOIN Expense e ON b.category_id = e.category_id 
+            AND e.user_id = %s
+            AND EXTRACT(MONTH FROM e.date) = %s 
+            AND EXTRACT(YEAR FROM e.date) = %s
+        WHERE b.user_id = %s AND b.budget_month = %s AND b.budget_year = %s;
+    """, (user_id, current_month, current_year, user_id, current_month, current_year))
+    
+    summary = cursor.fetchone()
+    total_budget = float(summary[0]) if summary else 0.0
+    total_spent = float(summary[1]) if summary else 0.0
+    
+    return {
+        "nav_budget": total_budget,
+        "nav_spent": total_spent,
+        "nav_remaining": total_budget - total_spent
+    }
+
+# --- AUTHENTICATION ROUTES ---
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        email = request.form.get('email', '').strip()
+        password = request.form.get('password', '')
+
+        if not username or not email or not password:
+            flash("All fields are required.", "danger")
+            return render_template('register.html')
+
+        hashed_password = generate_password_hash(password)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO Users (username, email, password_hash) VALUES (%s, %s, %s);",
+                (username, email, hashed_password)
+            )
+            conn.commit()
+            flash("Registration successful! Please log in.", "success")
+            return redirect(url_for('login'))
+        except psycopg2.IntegrityError:
+            conn.rollback()
+            flash("Username or email already registered.", "danger")
+        finally:
+            cursor.close()
+            conn.close()
+
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT user_id, password_hash FROM Users WHERE username = %s;", 
+            (username,)
+        )
+        user = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if user and check_password_hash(user[1], password):
+            session.clear()
+            session['user_id'] = user[0]
+            session['username'] = username
+            flash("Welcome back!", "success")
+            return redirect(url_for('index'))
+        else:
+            flash("Invalid username or password.", "danger")
+
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash("You have been logged out.", "info")
+    return redirect(url_for('login'))
+
+# --- CORE EXPENSE & DASHBOARD ROUTES ---
+
+@app.route('/')
+@login_required
+def index():
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Fetch User Expenses
+    cursor.execute("""
+        SELECT e.expense_id, e.amount, e.description, e.date, c.category_name, e.category_id
         FROM Expense e
         LEFT JOIN Category c ON e.category_id = c.category_id
-        WHERE e.amount IS NOT NULL
+        WHERE e.user_id = %s
         ORDER BY e.date DESC, e.expense_id DESC;
-    ''')
-    history = cursor.fetchall()
-    
-    cursor.execute('''
-        SELECT COALESCE(c.category_name, 'Uncategorized'), SUM(e.amount)
-        FROM Expense e
-        LEFT JOIN Category c ON e.category_id=c.category_id
-        GROUP BY c.category_name
-    ''')
+    """, (user_id,))
+    expenses = cursor.fetchall()
+
+    # Fetch Categories for dropdown selection
+    cursor.execute("SELECT category_id, category_name FROM Category ORDER BY category_name;")
+    categories = cursor.fetchall()
+
+    # Spending by Category for Chart.js
+    cursor.execute("""
+        SELECT c.category_name, COALESCE(SUM(e.amount), 0)
+        FROM Category c
+        INNER JOIN Expense e ON c.category_id = e.category_id
+        WHERE e.user_id = %s
+        GROUP BY c.category_name;
+    """, (user_id,))
     chart_data = cursor.fetchall()
-    
-    return total_spent, all_categories, history, chart_data
-     
-    
-@app.route('/', methods=['GET', 'POST'])
-def home():
-    # 🌟 Level 1: All these start exactly 4 spaces in
-    conn = psycopg2.connect(**DB_CONFIG)
-    cursor = conn.cursor()
+    chart_labels = [row[0] for row in chart_data]
+    chart_values = [float(row[1]) for row in chart_data]
 
-    if request.method == 'POST':
-        # 🌟 Level 2: These start exactly 8 spaces in
-        expense_amount = request.form.get('amount')
-        expense_desc = request.form.get('description')
-        selected_category=request.form.get('category')
-        
-        try:
-            cursor.execute('''
-                INSERT INTO Expense (user_id, category_id, amount, description, payment_method)
-                VALUES (NULL, %s, %s, %s, 'Cash');
-            ''', (selected_category,expense_amount, expense_desc))
-            conn.commit()
-            print(f"\n✅ SUCCESS! Saved to PostgreSQL: {expense_amount} for {expense_desc}\n")
-        except Exception as e:
-            conn.rollback()
-            print(f"\n❌ Database Insert Failed: {e}\n")
-        finally:
-            cursor.close()
-            conn.close()
-        return redirect('/')
-    
-    # B. READ FLOW (Normal Page Load)
-    total_spent, all_categories, history, chart_data = get_shared_layout_data(cursor)
+    layout_data = get_shared_layout_data(cursor, user_id)
+
     cursor.close()
     conn.close()
-    
-    # Separate the names and the amounts into clean lists for JavaScript to read
-    chart_labels = [row[0] for row in chart_data]
-    chart_values = [float(row[1]) for row in chart_data]
 
-    return render_template('index.html', expenses=history, categories=all_categories, 
-                           total=total_spent, edit_expense=None,
-                           chart_labels=chart_labels, chart_values=chart_values)
-    
-@app.route('/edit/<int:expense_id>')
-def edit_expense(expense_id):
-    """Triggered when user clicks 'Edit'. Reloads layout with record loaded into input forms."""
-    conn = psycopg2.connect(**DB_CONFIG)
+    return render_template(
+        'index.html',
+        expenses=expenses,
+        categories=categories,
+        chart_labels=chart_labels,
+        chart_values=chart_values,
+        layout_data=layout_data,
+        username=session.get('username')
+    )
+
+@app.route('/add_expense', methods=['POST'])
+@login_required
+def add_expense():
+    user_id = session['user_id']
+    amount = request.form.get('amount')
+    description = request.form.get('description', '').strip()
+    category_id = request.form.get('category_id')
+    expense_date = request.form.get('date') or datetime.now().strftime('%Y-%m-%d')
+
+    conn = get_db_connection()
     cursor = conn.cursor()
-    
-    try:
-        # Fetch the target expense item we want to modify
-        cursor.execute('''
-            SELECT amount, 
-            description, 
-            TO_CHAR(e.date, 'DD-Mon-YYYY'),
-            NULL AS category_name, 
-            e.expense_id, 
-            e.category_id,
-            COALESCE((
-                SELECT budget_amount 
-                FROM Budget 
-                WHERE category_id = e.category_id 
-                  AND budget_month = EXTRACT(MONTH FROM e.date)
-                  AND budget_year = EXTRACT(YEAR FROM e.date)
-                LIMIT 1
-                ), 0) AS budget_limit,
-                COALESCE((
-                    SELECT SUM(amount) 
-                    FROM Expense 
-                    WHERE category_id = e.category_id 
-                      AND EXTRACT(MONTH FROM date) = EXTRACT(MONTH FROM e.date)
-                      AND EXTRACT(YEAR FROM date) = EXTRACT(YEAR FROM e.date)
-                ), 0) AS total_spent_that_month
-            FROM Expense WHERE expense_id = %s;
-        ''', (expense_id,))
-        target_item = cursor.fetchone()
-        
-        # Load all ambient dashboard records around it
-        total_spent, all_categories, history,chart_data = get_shared_layout_data(cursor)
-    except Exception as e:
-        print(f"❌ Error loading edit state: {e}")
-        return redirect('/')
-    finally:
-        cursor.close()
-        conn.close()
+    cursor.execute("""
+        INSERT INTO Expense (amount, description, date, category_id, user_id)
+        VALUES (%s, %s, %s, %s, %s);
+    """, (amount, description, expense_date, category_id, user_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-    chart_labels = [row[0] for row in chart_data]
-    chart_values = [float(row[1]) for row in chart_data]
+    flash("Expense added successfully!", "success")
+    return redirect(url_for('index'))
 
-    return render_template('index.html', expenses=history, categories=all_categories, 
-                           total=total_spent, edit_expense=target_item,
-                           chart_labels=chart_labels, chart_values=chart_values)
-    
-@app.route('/update/<int:expense_id>', methods=['POST'])
-def update_expense(expense_id):
-    """Triggered when the form is submitted while operating in Edit Mode."""
-    conn = psycopg2.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-
-    updated_amount = request.form.get('amount')
-    updated_desc = request.form.get('description')
-    updated_cat = request.form.get('category')
-    
-    try:
-        # Run standard SQL UPDATE query targeted to this ID
-        cursor.execute('''
-            UPDATE Expense 
-            SET amount = %s, description = %s, category_id = %s
-            WHERE expense_id = %s;
-        ''', (updated_amount, updated_desc, updated_cat, expense_id))
-        conn.commit()
-        print(f"\n✏️ SUCCESS! Updated item ID: {expense_id} in PostgreSQL\n")
-    except Exception as e:
-        conn.rollback()
-        print(f"\n❌ Database Update Failed: {e}\n")
-    finally:
-        cursor.close()
-        conn.close()
-        
-    return redirect('/')
-
-    
-@app.route('/delete/<int:expense_id>')
+@app.route('/delete_expense/<int:expense_id>', methods=['POST'])
+@login_required
 def delete_expense(expense_id):
-    conn=psycopg2.connect(**DB_CONFIG)
-    cursor=conn.cursor()
-
-    try:
-        # run the targeted delete cmd for spcific row id
-        cursor.execute("DELETE FROM Expense WHERE expense_id=%s;" ,(expense_id,))
-        conn.commit()
-        print(f"\n SUCCESS! Deleted expense ID:{expense_id} from postgreSQL\n")
-    except Exception as e:
-        conn.rollback()
-        print(f"\n FAILED deletion:{e}\n")
-    finally:
-        cursor.close()
-        conn.close()
-
-    #redirect back to the main database page 
-    return redirect('/')
-
-@app.route('/categories', methods=['GET', 'POST'])
-def manage_categories():
-    conn = psycopg2.connect(**DB_CONFIG)
+    user_id = session['user_id']
+    conn = get_db_connection()
     cursor = conn.cursor()
-
-    # 🅰️ WRITE FLOW: If the user submits a new category name
-    if request.method == 'POST':
-        new_cat_name = request.form.get('category_name')
-        
-        try:
-            cursor.execute('''
-                INSERT INTO Category (category_name) 
-                VALUES (%s);
-            ''', (new_cat_name,))
-            conn.commit()
-            print(f"\n✅ SUCCESS! Added new category: {new_cat_name}\n")
-        except Exception as e:
-            conn.rollback()
-            print(f"\n❌ Failed to add category: {e}\n")
-        finally:
-            cursor.close()
-            conn.close()
-        return redirect('/categories')
-
-    # 🅱️ READ FLOW: Fetch all categories to show on the page
-    cursor.execute("SELECT category_id, category_name FROM Category ORDER BY category_name ASC;")
-    all_categories = cursor.fetchall()
-    
+    cursor.execute("DELETE FROM Expense WHERE expense_id = %s AND user_id = %s;", (expense_id, user_id))
+    conn.commit()
     cursor.close()
     conn.close()
-    
-    return render_template('categories.html', categories=all_categories)
 
-@app.route('/categories/delete/<int:category_id>')
-def delete_category(category_id):
-    conn = psycopg2.connect(**DB_CONFIG)
+    flash("Expense deleted.", "info")
+    return redirect(url_for('index'))
+
+# --- BUDGET MANAGEMENT ROUTES (MATCHING budgets.html) ---
+
+@app.route('/budgets', methods=['GET', 'POST'])
+@login_required
+def budgets():
+    user_id = session['user_id']
+    conn = get_db_connection()
     cursor = conn.cursor()
 
-    try:
-        cursor.execute("DELETE FROM Category WHERE category_id = %s;", (category_id,))
+    # Handle Form Submission for Adding a Budget
+    if request.method == 'POST':
+        category_id = request.form.get('category_id')
+        budget_amount = request.form.get('budget_amount')
+        budget_month = request.form.get('budget_month')
+        budget_year = request.form.get('budget_year')
+
+        cursor.execute("""
+            INSERT INTO Budget (category_id, budget_amount, budget_month, budget_year, user_id)
+            VALUES (%s, %s, %s, %s, %s);
+        """, (category_id, budget_amount, budget_month, budget_year, user_id))
         conn.commit()
-        print(f"\n🗑️ SUCCESS! Deleted category ID: {category_id}\n")
-    except Exception as e:
-        conn.rollback()
-        # This catches if an expense is still using this category (Foreign Key Constraint)
-        print(f"\n❌ Cannot delete category. It might be linked to existing expenses: {e}\n")
-    finally:
         cursor.close()
         conn.close()
 
-    return redirect('/categories')
+        flash("Budget target saved successfully!", "success")
+        return redirect(url_for('budgets'))
 
-
-@app.route('/budgets', methods=['GET','POST'])
-def manage_budgets():
-    conn = psycopg2.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-
-    if request.method =='POST':
-        cat_id = request.form.get('category_id')
-        amount =request.form.get('budget_amount')
-        month =request.form.get('budget_month')
-        year =request.form.get('budget_year')
-            
-        try:
-            cursor.execute('''
-                INSERT INTO Budget(category_id, budget_amount, budget_month, budget_year)
-                values(%s, %s, %s, %s);
-            ''', (cat_id, amount, month, year))    
-            conn.commit()
-            print(f"\n✅ SUCCESS! Added budget limit of ₹{amount} for category ID: {cat_id}")
-        except Exception as e:
-            conn.rollback()
-            print(f"\n❌ Failed to add budget: {e}\n")
-        finally:
-            cursor.close()
-            conn.close()
-        return redirect('/budgets')
-    
-    cursor.execute('''
-        SELECT b.budget_id, 
-            c.category_name, 
+    # Fetch Active Budgets
+    # b[0]=budget_id, b[1]=category_name, b[2]=budget_amount, b[3]=budget_month, b[4]=budget_year, b[5]=spent
+    cursor.execute("""
+        SELECT 
+            b.budget_id,
+            c.category_name,
             b.budget_amount,
             b.budget_month,
             b.budget_year,
-            COALESCE(SUM(e.amount),0) AS total_spent
+            COALESCE(SUM(e.amount), 0) AS spent,
+            b.category_id
         FROM Budget b
-        LEFT JOIN Category c ON b.category_id=c.category_id
-        LEFT JOIN Expense e ON b.category_id = e.category_id
-            AND EXTRACT (MONTH FROM e.date) =b.budget_month
-            AND EXTRACT (YEAR FROM e.date) =b.budget_year
-        GROUP BY b.budget_id, c.category_name, b.budget_amount, b.budget_month, b.budget_year
-        ORDER BY b.budget_year DESC, b.budget_month DESC ;
-    ''')
-    all_budgets = cursor.fetchall()
-    
-    cursor.execute("SELECT category_id, category_name FROM Category ORDER BY category_name ASC;")
-    all_categories=cursor.fetchall()
+        JOIN Category c ON b.category_id = c.category_id
+        LEFT JOIN Expense e ON b.category_id = e.category_id 
+            AND e.user_id = %s
+            AND EXTRACT(MONTH FROM e.date) = b.budget_month 
+            AND EXTRACT(YEAR FROM e.date) = b.budget_year
+        WHERE b.user_id = %s
+        GROUP BY b.budget_id, c.category_name, b.budget_amount, b.budget_month, b.budget_year, b.category_id
+        ORDER BY b.budget_year DESC, b.budget_month DESC;
+    """, (user_id, user_id))
+    budget_records = cursor.fetchall()
+
+    # Fetch Categories for dropdown
+    cursor.execute("SELECT category_id, category_name FROM Category ORDER BY category_name;")
+    categories = cursor.fetchall()
+
+    layout_data = get_shared_layout_data(cursor, user_id)
 
     cursor.close()
     conn.close()
 
-    return render_template('budgets.html', budgets=all_budgets, categories=all_categories,edit_budget=None)
+    return render_template(
+        'budgets.html',
+        budgets=budget_records,
+        categories=categories,
+        edit_budget=None,
+        layout_data=layout_data,
+        username=session.get('username')
+    )
+
 @app.route('/budgets/edit/<int:budget_id>')
+@login_required
 def edit_budget(budget_id):
-    """Triggered when user clicks 'Edit' on a budget row. Loads data back into the ambient view."""
-    conn = psycopg2.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-    
-    try:
-        # Fetch the targeting budget item
-        cursor.execute('''
-            SELECT budget_amount, budget_month, budget_year, category_id, budget_id 
-            FROM Budget WHERE budget_id = %s;
-        ''', (budget_id,))
-        target_budget = cursor.fetchone()
-        
-        # Load the surrounding dashboard elements so the page renders completely
-        cursor.execute('''
-            SELECT b.budget_id, 
-                c.category_name, 
-                b.budget_amount,
-                b.budget_month,
-                b.budget_year,
-                COALESCE(SUM(e.amount),0) AS total_spent,
-                b.category_id
-            FROM Budget b
-            LEFT JOIN Category c ON b.category_id=c.category_id
-            LEFT JOIN Expense e ON b.category_id = e.category_id
-                AND EXTRACT (MONTH FROM e.date) = b.budget_month
-                AND EXTRACT (YEAR FROM e.date) = b.budget_year
-            GROUP BY b.budget_id, c.category_name, b.budget_amount, b.budget_month, b.budget_year, b.category_id
-            ORDER BY b.budget_year DESC, b.budget_month DESC ;
-        ''')
-        all_budgets = cursor.fetchall()
-        
-        cursor.execute("SELECT category_id, category_name FROM Category ORDER BY category_name ASC;")
-        all_categories = cursor.fetchall()
-        
-    except Exception as e:
-        print(f"❌ Error loading budget edit state: {e}")
-        return redirect('/budgets')
-    finally:
-        cursor.close()
-        conn.close()
-        
-    return render_template('budgets.html', budgets=all_budgets, categories=all_categories, edit_budget=target_budget)
-@app.route('/budgets/update/<int:budget_id>', methods=['POST'])
-def update_budget(budget_id):
-    """Processes the submitted form to update an existing budget target."""
-    conn = psycopg2.connect(**DB_CONFIG)
+    user_id = session['user_id']
+    conn = get_db_connection()
     cursor = conn.cursor()
 
-    updated_cat = request.form.get('category_id')
-    updated_amount = request.form.get('budget_amount')
-    updated_month = request.form.get('budget_month')
-    updated_year = request.form.get('budget_year')
-    
-    try:
-        cursor.execute('''
-            UPDATE Budget 
-            SET category_id = %s, budget_amount = %s, budget_month = %s, budget_year = %s
-            WHERE budget_id = %s;
-        ''', (updated_cat, updated_amount, updated_month, updated_year, budget_id))
-        conn.commit()
-        print(f"\n✏️ SUCCESS! Updated Budget ID: {budget_id}\n")
-    except Exception as e:
-        conn.rollback()
-        print(f"\n❌ Database Budget Update Failed: {e}\n")
-    finally:
-        cursor.close()
-        conn.close()
-        
-    return redirect('/budgets')
+    # Fetch the specific budget for the edit form
+    # Returns: (budget_amount, budget_month, budget_year, category_id, budget_id)
+    cursor.execute("""
+        SELECT budget_amount, budget_month, budget_year, category_id, budget_id
+        FROM Budget
+        WHERE budget_id = %s AND user_id = %s;
+    """, (budget_id, user_id))
+    target_budget = cursor.fetchone()
 
-    
-def get_shared_layout_data(cursor):
-    """Helper function to fetch layout details to keep code DRY (Don't Repeat Yourself)."""
-    # 1. Fetch total sum of all expenses
-    cursor.execute("SELECT SUM(amount) FROM Expense;")
-    total_result = cursor.fetchone()[0]
-    total_spent = total_result if total_result is not None else 0.00
-
-    # 2. Fetch categories for dropdown
-    cursor.execute("SELECT category_id, category_name FROM Category ORDER BY category_name ASC;")
-    all_categories = cursor.fetchall()
-    
-    # 3. Fetch updated expenses history table with precise budget alerts (Strict Single Rows!)
-    cursor.execute('''
+    # Fetch active budgets for the table
+    cursor.execute("""
         SELECT 
-            e.amount, 
-            e.description, 
-            TO_CHAR(e.date, 'DD-Mon-YYYY'), 
-            c.category_name, 
-            e.expense_id, 
-            e.category_id,
-            COALESCE((
-                SELECT b.budget_amount
-                FROM Budget b
-                WHERE b.category_id = e.category_id 
-                  AND b.budget_month = EXTRACT(MONTH FROM e.date)
-                  AND b.budget_year = EXTRACT(YEAR FROM e.date)
-                LIMIT 1
-            ), 0) AS budget_limit,
-            COALESCE((
-                SELECT SUM(sub_e.amount)
-                FROM Expense sub_e
-                WHERE sub_e.category_id = e.category_id 
-                  AND EXTRACT(MONTH FROM sub_e.date) = EXTRACT(MONTH FROM e.date)
-                  AND EXTRACT(YEAR FROM sub_e.date) = EXTRACT(YEAR FROM e.date)
-            ), 0) AS total_spent_that_month
-        FROM Expense e
-        LEFT JOIN Category c ON e.category_id = c.category_id
-        WHERE e.amount IS NOT NULL
-        ORDER BY e.date DESC, e.expense_id DESC;
-    ''')
-    history = cursor.fetchall()
-    
-    cursor.execute('''
-        SELECT COALESCE(c.category_name, 'Uncategorized'), SUM(e.amount)
-        FROM Expense e
-        LEFT JOIN Category c ON e.category_id=c.category_id
-        GROUP BY c.category_name
-    ''')
-    chart_data = cursor.fetchall()
-    
-    return total_spent, all_categories, history, chart_data
+            b.budget_id,
+            c.category_name,
+            b.budget_amount,
+            b.budget_month,
+            b.budget_year,
+            COALESCE(SUM(e.amount), 0) AS spent,
+            b.category_id
+        FROM Budget b
+        JOIN Category c ON b.category_id = c.category_id
+        LEFT JOIN Expense e ON b.category_id = e.category_id 
+            AND e.user_id = %s
+            AND EXTRACT(MONTH FROM e.date) = b.budget_month 
+            AND EXTRACT(YEAR FROM e.date) = b.budget_year
+        WHERE b.user_id = %s
+        GROUP BY b.budget_id, c.category_name, b.budget_amount, b.budget_month, b.budget_year, b.category_id
+        ORDER BY b.budget_year DESC, b.budget_month DESC;
+    """, (user_id, user_id))
+    budget_records = cursor.fetchall()
+
+    cursor.execute("SELECT category_id, category_name FROM Category ORDER BY category_name;")
+    categories = cursor.fetchall()
+
+    layout_data = get_shared_layout_data(cursor, user_id)
+
+    cursor.close()
+    conn.close()
+
+    return render_template(
+        'budgets.html',
+        budgets=budget_records,
+        categories=categories,
+        edit_budget=target_budget,
+        layout_data=layout_data,
+        username=session.get('username')
+    )
+
+@app.route('/budgets/update/<int:budget_id>', methods=['POST'])
+@login_required
+def update_budget(budget_id):
+    user_id = session['user_id']
+    category_id = request.form.get('category_id')
+    budget_amount = request.form.get('budget_amount')
+    budget_month = request.form.get('budget_month')
+    budget_year = request.form.get('budget_year')
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE Budget 
+        SET category_id = %s, budget_amount = %s, budget_month = %s, budget_year = %s
+        WHERE budget_id = %s AND user_id = %s;
+    """, (category_id, budget_amount, budget_month, budget_year, budget_id, user_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    flash("Budget updated successfully!", "success")
+    return redirect(url_for('budgets'))
 
 @app.route('/budgets/delete/<int:budget_id>')
+@login_required
 def delete_budget(budget_id):
-    """Removes a budget entry by its specific ID."""
-    conn = psycopg2.connect(**DB_CONFIG)
+    user_id = session['user_id']
+    conn = get_db_connection()
     cursor = conn.cursor()
+    cursor.execute("DELETE FROM Budget WHERE budget_id = %s AND user_id = %s;", (budget_id, user_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-    try:
-        cursor.execute("DELETE FROM Budget WHERE budget_id = %s;", (budget_id,))
-        conn.commit()
-        print(f"\n🗑️ SUCCESS! Deleted budget ID: {budget_id}\n")
-    except Exception as e:
-        conn.rollback()
-        print(f"\n❌ Failed to delete budget: {e}\n")
-    finally:
-        cursor.close()
-        conn.close()
+    flash("Budget deleted.", "info")
+    return redirect(url_for('budgets'))
 
-    return redirect('/budgets')    
 if __name__ == '__main__':
     app.run(debug=True)
